@@ -22,29 +22,27 @@
 
 ## 部署
 
-**一键部署**：点上面的「Deploy to Cloudflare」按钮，按提示授权 GitHub 并创建仓库副本即可
+**一键部署（推荐）**：点上面的「Deploy to Cloudflare」按钮，按提示授权 GitHub 并创建仓库副本即可
 （Cloudflare 会自动构建并持续部署后续 push）。
 
-**命令行**：
+**手动部署**：
 
-```bash
-npm i -g wrangler
-wrangler login
-wrangler deploy
-```
-
-部署完输出形如 `https://media-bridge-relay.<你的子域>.workers.dev` —— 把它填进面板
-「面板设置 → 播放中继设置」，并打开「外转到外部字节代理」开关。
+1. 登录 [Cloudflare Dashboard](https://dash.cloudflare.com) → 左侧 **Workers 和 Pages** →
+   **创建** → **Worker**，起个名字 → **部署**（先得到一个默认 Worker）。
+2. 进入这个 Worker → **编辑代码**，把本仓库 [`src/worker.js`](src/worker.js) 的全部内容
+   粘贴进去覆盖默认代码 → **部署**。
+3. 部署完地址形如 `https://<你起的名字>.<你的子域>.workers.dev` —— 把它填进面板
+   「面板设置 → 播放中继设置」，并打开「外转到外部字节代理」开关。
 
 ## 可选：设共享密钥（推荐）
 
 不设密钥，任何知道你 Worker 地址的人都能拿来当开放代理用。设了之后面板侧填同一个值，302 链接会带签名：
 
-```bash
-wrangler secret put SECRET
-```
+1. Worker 页 → **设置** → **变量和机密**（部分账号显示为「运行时变量和密钥」）。
+2. **添加**：类型选 **机密（Secret）**，名称填 `SECRET`，值填你的密钥 → 保存。
+3. **重新部署一次 Worker** 让变量生效（只加变量不部署 = 不生效）。
 
-面板侧填进「外部字节代理签名密钥」即可，两边不用同步部署。
+面板侧把同一个值填进「外部代理签名密钥」即可，两边不用同步部署。
 
 ## 限额提醒
 

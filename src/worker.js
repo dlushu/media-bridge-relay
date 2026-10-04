@@ -245,8 +245,12 @@ export default {
       }
     }
 
-    /* threads / chunkKB 都是面板「播放中继设置」传过来的；不带 → 单连接透传 */
-    const threads = Math.max(1, Math.min(Number(q.get('threads')) || 0, 16));
+    /* threads / chunkKB 都是面板「播放中继设置」传过来的；不带 → 单连接透传。
+     * ⚠️ 并发**硬封顶 12**：实测对同一上游开 ≥13 条连接时，多余的会被掐、fetch 重试
+     *    立刻把子请求预算打满 → CF 1101 把整个请求杀掉（现象：4 秒左右、1~2MB 死流）；
+     *    12 条以内全部稳定（夸克 12 路实测 ~4.3MB/s）。这是单 Worker 请求的并发天花板，
+     *    面板设置里填再大也在这里压平。 */
+    const threads = Math.max(1, Math.min(Number(q.get('threads')) || 0, 12));
     const chunkKB = Math.max(64, Math.min(Number(q.get('chunkKB')) || 0, 8192));
     const reqRange = req.headers.get('range') || '';
     if (!threads || !chunkKB || req.method !== 'GET') {

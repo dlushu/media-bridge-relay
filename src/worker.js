@@ -28,6 +28,12 @@ const PROBE_BYTES = 1024;
 const MAX_SUBREQUESTS = 48;
 /** 单发子请求的超时（客户端在等这一跳） */
 const TIMEOUT_MS = 15000;
+/** 每块「从发起到数据到齐」的硬超时 —— 比 fetch 的 15s 网络超时更严格，
+ *  解决「网盘 CDN 节点慢但不挂」导致的整流卡顿（hydraria 的慢判死思路） */
+const CHUNK_TIMEOUT_MS = 30000;
+/** 首块自适应：播放器 `bytes=0-` 探测时，前 N 块用小尺寸（探测完大多会 seek，少浪费在飞字节） */
+const HEAD_SMALL_COUNT = 4;
+const HEAD_SMALL_SIZE = 256 * 1024;
 
 /** base64url → 字符串（Cloudflare 环境自带 atob） */
 function fromB64Url(s) {
@@ -131,7 +137,14 @@ async function pipeThrough(url, headers, reqMethod, reqRange) {
   return new Response(up.body, { status: up.status, headers: out });
 }
 
-/** 分块并发分支：探总长 → 有界切块 → threads 路在飞、按序吐（面板 relayChunked 的移植） */
+/** 分块并发分支：探总长 → 有界切块 → threads 路在飞、按序吐（面板 relayChunked 的移植）
+ *
+ *  P0 首块自适应：客户端 Range 为 `bytes=0-`（或无 Range 且从 0 开始）时，前 4 块用 256KB。
+ *    播放器起播常发 `bytes=0-` 探测元数据，读几百 KB 就 seek 别处；大块全部在飞浪费带宽。
+ *  P1 慢判死：每块 30s 硬超时（从发起到数据到齐）。某块 CDN 节点慢但不挂时，不再等满
+ *    fetch 的 15s×3 重试（最坏 45s），30s 一到就标记失败、流尾写原因、正常关闭。
+ *  块乱序完成、按序吐：pending 里的块谁先完成谁先进缓冲区，pull 按序号吐，慢块不卡快块。
+ */
 async function chunked(url, headers, reqRange, threads, chunkSize) {
   /* 子请求实际计数（探针 + 每个块的每次重试都算）—— CF 免费版单请求 50 发，超了
      直接 1101；不能只按"块数"做预算，重试一多发就超 */
@@ -155,7 +168,19 @@ async function chunked(url, headers, reqRange, threads, chunkSize) {
   if (!total) return pipeThrough(url, headers, 'GET', reqRange);
 
   const r = resolveRange(parseRange(reqRange), total);
-  const count = Math.max(1, Math.ceil((r.end - r.start + 1) / chunkSize));
+
+  /* P0 首块自适应：探测式请求（bytes=0- 或从头全量）前 N 块小尺寸 */
+  const isProbe = reqRange === 'bytes=0-' || (!reqRange && r.start === 0);
+  const chunkBounds = [];
+  let pos = r.start;
+  while (pos <= r.end) {
+    const i = chunkBounds.length;
+    const size = isProbe && i < HEAD_SMALL_COUNT ? HEAD_SMALL_SIZE : chunkSize;
+    const end = Math.min(pos + size - 1, r.end);
+    chunkBounds.push({ start: pos, end });
+    pos = end + 1;
+  }
+  const count = chunkBounds.length;
 
   const out = new Headers();
   out.set('cache-control', 'no-store');
@@ -164,48 +189,117 @@ async function chunked(url, headers, reqRange, threads, chunkSize) {
   out.set('content-length', String(r.end - r.start + 1));
   if (r.ranged) out.set('content-range', `bytes ${r.start}-${r.end}/${total}`);
 
-  let launched = 0;
-  const pending = new Map();
-  const launch = () => {
-    /* 两条硬上限：块数（本次要搬的）与子请求总数（含重试，给在飞的块留重试余量：
-       每块最多 3 发，故只在 used ≤ MAX-3 时发新块）*/
-    while (launched < count && pending.size < threads && used <= MAX_SUBREQUESTS - 3) {
-      const i = launched;
-      launched += 1;
-      const a = r.start + i * chunkSize;
-      pending.set(i, fetchChunkRetry(url, headers, a, Math.min(a + chunkSize - 1, r.end), tick));
+  /* P1 慢判死：块状态机
+   *   null      = 未发
+   *   'pending' = 在飞
+   *   {buf}     = 完成（乱序完成先进缓冲区，按序吐）
+   *   {error}   = 失败（含 30s 超时）
+   *   {passthrough} = 上游不认 Range，整流吐回
+   */
+  const chunks = new Array(count).fill(null);
+  let nextToEmit = 0;
+  let passthroughRes = null;
+
+  const launchChunk = async (i) => {
+    if (passthroughRes) {
+      chunks[i] = { error: 'passthrough' };
+      return;
+    }
+    const { start, end } = chunkBounds[i];
+    const result = await fetchChunkRetry(url, headers, start, end, tick);
+    if (passthroughRes) {
+      chunks[i] = { error: 'passthrough' };
+      return;
+    }
+
+    if (result.error || !result.res) {
+      chunks[i] = { error: result.error || `HTTP ${result.status}` };
+      return;
+    }
+
+    const res = result.res;
+    if (res.status !== 206) {
+      /* 上游不理会切块范围（回整片 200 等）：整流吐回，后续块作废 */
+      passthroughRes = res;
+      chunks[i] = { passthrough: res };
+      /* 把其他在飞的块标记作废，避免 pull 死等 */
+      for (let j = 0; j < count; j += 1) {
+        if (chunks[j] === 'pending') chunks[j] = { error: 'passthrough' };
+      }
+      return;
+    }
+
+    /* 读数据，带 30s 硬超时（从发起到数据到齐） */
+    const dataPromise = res.arrayBuffer();
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('chunk timeout')), CHUNK_TIMEOUT_MS),
+    );
+    try {
+      const buf = await Promise.race([dataPromise, timeoutPromise]);
+      chunks[i] = { buf: new Uint8Array(buf) };
+    } catch (e) {
+      chunks[i] = { error: `chunk timeout (${CHUNK_TIMEOUT_MS}ms)` };
+      try { res.body?.cancel(); } catch { /* 无所谓 */ }
     }
   };
 
+  let launched = 0;
+  const launch = () => {
+    if (passthroughRes) return;
+    while (launched < count && used <= MAX_SUBREQUESTS - 3) {
+      const inFlight = chunks.filter((c) => c === 'pending').length;
+      if (inFlight >= threads) break;
+      const i = launched;
+      launched += 1;
+      chunks[i] = 'pending';
+      launchChunk(i);
+    }
+  };
+
+  launch();
+
   const body = new ReadableStream({
     async pull(ctrl) {
-      if (!pending.size && (launched >= count || used > MAX_SUBREQUESTS - 3)) {
+      /* 上游不认 Range：整流吐回，不再分块 */
+      if (passthroughRes) {
+        if (passthroughRes.body) {
+          await passthroughRes.body.pipeTo(new WritableStream({ write: (c) => ctrl.enqueue(c) }));
+        }
+        ctrl.close();
+        return;
+      }
+
+      /* 等 nextToEmit 完成（乱序完成的块在缓冲区里等，不卡快块） */
+      while (nextToEmit < count && chunks[nextToEmit] === 'pending') {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+
+      if (nextToEmit >= count) {
         ctrl.close(); // 搬完 / 子请求预算用尽：正常收尾，播放器拿断点重连续传
         return;
       }
-      launch();
-      const i = pending.keys().next().value;
-      const got = await pending.get(i);
-      pending.delete(i);
-      if (got.error || !got.res) {
-        /* 重试 3 发仍失败：把原因写进流尾再正常关闭，不静默 error —— 客户端至少拿到
-           已下载部分，诊断在尾巴上看得见（旧做法直接 error = 3 块整流失效） */
-        ctrl.enqueue(new TextEncoder().encode(`\n[media-bridge-relay] 第${i + 1}块取失败（重试 3 发）：${got.error || '未知'}`));
-        ctrl.close();
-        return;
-      }
-      const res = got.res;
-      /* 上游不理会切块范围（回整片 200 等）：整流吐回，后续块作废 */
-      if (res.status !== 206) {
-        if (res.body) {
-          await res.body.pipeTo(new WritableStream({ write: (c) => ctrl.enqueue(c) }));
+
+      const got = chunks[nextToEmit];
+      nextToEmit += 1;
+
+      if (got.passthrough) {
+        if (got.passthrough.body) {
+          await got.passthrough.body.pipeTo(new WritableStream({ write: (c) => ctrl.enqueue(c) }));
         }
-        pending.clear();
-        launched = count;
         ctrl.close();
         return;
       }
-      ctrl.enqueue(new Uint8Array(await res.arrayBuffer()));
+
+      if (got.error || !got.buf) {
+        /* 30s 超时 / 重试 3 发仍失败：把原因写进流尾再正常关闭，不静默 error —— 客户端至少拿到
+           已下载部分，诊断在尾巴上看得见（旧做法直接 error = 整流失效） */
+        ctrl.enqueue(new TextEncoder().encode(`\n[media-bridge-relay] 第${nextToEmit}块取失败：${got.error || '未知'}`));
+        ctrl.close();
+        return;
+      }
+
+      ctrl.enqueue(got.buf);
+      launch(); // 补发新块，保持 threads 路在飞
     },
   });
   return new Response(body, { status: r.ranged ? 206 : 200, headers: out });

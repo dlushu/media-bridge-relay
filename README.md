@@ -3,6 +3,8 @@
 [媒体桥面板](https://github.com/dlushu/media-bridge-panel)的**外部字节中继**（Cloudflare Worker）：
 面板把上游地址、请求头、搬运参数全部 302 到这里，字节由 Cloudflare 边缘搬，面板只发 302。
 
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/dlushu/media-bridge-relay)
+
 ## 面板 302 过来的参数
 
 ```
@@ -20,6 +22,11 @@
 
 ## 部署
 
+**一键部署**：点上面的「Deploy to Cloudflare」按钮，按提示授权 GitHub 并创建仓库副本即可
+（Cloudflare 会自动构建并持续部署后续 push）。
+
+**命令行**：
+
 ```bash
 npm i -g wrangler
 wrangler login
@@ -27,7 +34,7 @@ wrangler deploy
 ```
 
 部署完输出形如 `https://media-bridge-relay.<你的子域>.workers.dev` —— 把它填进面板
-「面板设置 → 播放中继设置 → 外部字节代理 URL」。
+「面板设置 → 播放中继设置」，并打开「外转到外部字节代理」开关。
 
 ## 可选：设共享密钥（推荐）
 

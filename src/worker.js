@@ -17,9 +17,10 @@
  *     为了让每一发都变成有界 Range。
  *   · 单连接透传：客户端的 Range 原样带给上游，响应流式回，不碰字节形状。
  *
- * ⚠️ 子请求预算：**免费版单个 Worker 请求最多 50 个子请求**。分块模式下探 1 发 + 最多
- *    47 块，搬完就正常收尾 —— 播放器会拿断点 Range 重连续传（标准行为），能接着播。
- *    付费版上限 1000，基本用不完。
+ * ⚠️ 子请求预算：**免费版单个 Worker 请求最多 50 个子请求**。分块模式下探 1 发 + 每块每次
+ *    重试都算，所以单次只搬「预算内切得出的那些块」，并且 **Content-Length / Content-Range
+ *    严格等于实际吐出的字节**——播放器拿到的是一段完整合法的 206，自己按 Content-Range
+ *    续传下一段（标准行为）。付费版上限 1000，基本用不完。
  */
 
 /** 探一发先要多少字节（只为拿 `content-range` 里的总长，读完即断） */
@@ -34,6 +35,13 @@ const CHUNK_TIMEOUT_MS = 30000;
 /** 首块自适应：播放器 `bytes=0-` 探测时，前 N 块用小尺寸（探测完大多会 seek，少浪费在飞字节） */
 const HEAD_SMALL_COUNT = 4;
 const HEAD_SMALL_SIZE = 256 * 1024;
+/** 头部块对冲：前 N 块并发 **2 发**取先成功者。
+ *  实测 CF 共享出口对夸克同一 CDN 连接被拒是**一过性**的，首发偶发卡 10~16s（客户端就是
+ *  在这等首字节 → 起播慢/连接超时）。多发一条并行、谁先到用谁，把 TTFB 尾部压回正常值；
+ *  多花一个子请求，头部 4 块最多多 4 发，预算够。 */
+const HEAD_HEDGE = 2;
+/** 头部块硬超时更短：它们卡住 = 起播卡住，尽快换路重来比死等 30s 强 */
+const HEAD_CHUNK_TIMEOUT_MS = 10000;
 
 /** base64url → 字符串（Cloudflare 环境自带 atob） */
 function fromB64Url(s) {
@@ -121,6 +129,30 @@ async function fetchChunkRetry(url, headers, start, end, onAttempt) {
   return { error: last };
 }
 
+/**
+ * 竞速取块：并发跑多个 `fetchChunkRetry`，**第一个成功**的胜出，其余一落地就断其 body（不白占带宽）。
+ * 全部失败 → 回 null（调用方按失败处理）。
+ * @param {Promise<{res?:Response,status?:number,error?:string}>[]} promises
+ */
+function firstOk(promises) {
+  return new Promise((resolve) => {
+    let done = false;
+    let failed = 0;
+    const onSettle = (r) => {
+      const ok = r && r.res && r.res.ok;
+      if (done) {
+        // 输了的：若带 body（活着的上游响应），断掉，别让它继续下载
+        if (ok && r.res.body) { try { r.res.body.cancel(); } catch { /* 无所谓 */ } }
+        return;
+      }
+      if (ok) { done = true; resolve(r); return; }
+      failed += 1;
+      if (failed === promises.length) { done = true; resolve(null); }
+    };
+    for (const p of promises) p.then(onSettle, () => onSettle(null));
+  });
+}
+
 /** 透传分支：客户端的 Range 原样给上游，响应流式回 */
 async function pipeThrough(url, headers, reqMethod, reqRange) {
   const method = reqMethod === 'HEAD' ? 'HEAD' : 'GET';
@@ -168,12 +200,29 @@ async function chunked(url, headers, reqRange, threads, chunkSize) {
   if (!total) return pipeThrough(url, headers, 'GET', reqRange);
 
   const r = resolveRange(parseRange(reqRange), total);
+  /* 区间非法（起点已越到文件末尾之后，播放器偶尔会这么探）：交回透传，让上游正常回 416，
+     也避免下面切块切出 0 块、再去取 chunkBounds[-1] 崩掉 */
+  if (r.start > r.end) return pipeThrough(url, headers, 'GET', reqRange);
+
+  /* **可交付范围**（本文件最要紧的一处）：CF 免费版单请求最多 50 发子请求，探针已用 `used` 发。
+   * 必须先把「这次到底能搬多少字节」算清楚，再据此声明 Content-Length / Content-Range。
+   *
+   * 旧做法按客户端请求的**整段**声明长度（bytes=0- 时就是整片），预算一用完就提前关流
+   * → 客户端收到的字节**少于声明的 Content-Length** → 判定「连接被中途掐断」（现象就是
+   * 播到某个固定位置弹「连接超时」）。现在声明多少就吐多少，客户端拿到的是一个**完整合法**
+   * 的 206，自己按 Content-Range 接着发下一段续传（RFC 7233 允许 206 只覆盖请求区间的一部分）。
+   *
+   * 预算分配：留 3 发安全余量；头部块对冲各多发 1 发（共 HEAD_SMALL_COUNT 发）；再留
+   * RETRY_RESERVE 发给重试 —— 剩下的才用来切块，保证计划内的块不会被预算挤掉。 */
+  const RETRY_RESERVE = 8;
+  const chunkBudget = Math.max(1, MAX_SUBREQUESTS - 3 - used);
+  const maxChunks = Math.max(1, chunkBudget - HEAD_SMALL_COUNT - RETRY_RESERVE);
 
   /* P0 首块自适应：探测式请求（bytes=0- 或从头全量）前 N 块小尺寸 */
   const isProbe = reqRange === 'bytes=0-' || (!reqRange && r.start === 0);
   const chunkBounds = [];
   let pos = r.start;
-  while (pos <= r.end) {
+  while (pos <= r.end && chunkBounds.length < maxChunks) {
     const i = chunkBounds.length;
     const size = isProbe && i < HEAD_SMALL_COUNT ? HEAD_SMALL_SIZE : chunkSize;
     const end = Math.min(pos + size - 1, r.end);
@@ -181,13 +230,17 @@ async function chunked(url, headers, reqRange, threads, chunkSize) {
     pos = end + 1;
   }
   const count = chunkBounds.length;
+  const deliverEnd = chunkBounds[count - 1].end;
+  /* 覆盖不满整片就必须按 206 + Content-Range 回（200 的 Content-Length 必须等于完整实体长度，
+     截断了还回 200 = 骗客户端「文件就这么长」） */
+  const partial = r.ranged || deliverEnd < total - 1;
 
   const out = new Headers();
   out.set('cache-control', 'no-store');
   out.set('accept-ranges', 'bytes');
   out.set('content-type', probe.headers.get('content-type') || 'application/octet-stream');
-  out.set('content-length', String(r.end - r.start + 1));
-  if (r.ranged) out.set('content-range', `bytes ${r.start}-${r.end}/${total}`);
+  out.set('content-length', String(deliverEnd - r.start + 1));
+  if (partial) out.set('content-range', `bytes ${r.start}-${deliverEnd}/${total}`);
 
   /* P1 慢判死：块状态机
    *   null      = 未发
@@ -206,14 +259,20 @@ async function chunked(url, headers, reqRange, threads, chunkSize) {
       return;
     }
     const { start, end } = chunkBounds[i];
-    const result = await fetchChunkRetry(url, headers, start, end, tick);
+    /* 头部块对冲：并发 2 发取先成功者（治起播慢/首字节被一过性拒连卡死） */
+    const isHead = i < HEAD_SMALL_COUNT;
+    const result = isHead
+      ? await firstOk(
+          Array.from({ length: HEAD_HEDGE }, () => fetchChunkRetry(url, headers, start, end, tick)),
+        )
+      : await fetchChunkRetry(url, headers, start, end, tick);
     if (passthroughRes) {
       chunks[i] = { error: 'passthrough' };
       return;
     }
 
-    if (result.error || !result.res) {
-      chunks[i] = { error: result.error || `HTTP ${result.status}` };
+    if (!result || result.error || !result.res) {
+      chunks[i] = { error: (result && result.error) || (result && `HTTP ${result.status}`) || '取块失败' };
       return;
     }
 
@@ -229,16 +288,17 @@ async function chunked(url, headers, reqRange, threads, chunkSize) {
       return;
     }
 
-    /* 读数据，带 30s 硬超时（从发起到数据到齐） */
+    /* 读数据，带硬超时（从发起到数据到齐）—— 头部块用更短超时，卡住就尽快换路 */
+    const stallMs = isHead ? HEAD_CHUNK_TIMEOUT_MS : CHUNK_TIMEOUT_MS;
     const dataPromise = res.arrayBuffer();
     const timeoutPromise = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error('chunk timeout')), CHUNK_TIMEOUT_MS),
+      setTimeout(() => reject(new Error('chunk timeout')), stallMs),
     );
     try {
       const buf = await Promise.race([dataPromise, timeoutPromise]);
       chunks[i] = { buf: new Uint8Array(buf) };
     } catch (e) {
-      chunks[i] = { error: `chunk timeout (${CHUNK_TIMEOUT_MS}ms)` };
+      chunks[i] = { error: `chunk timeout (${stallMs}ms)` };
       try { res.body?.cancel(); } catch { /* 无所谓 */ }
     }
   };
@@ -280,7 +340,13 @@ async function chunked(url, headers, reqRange, threads, chunkSize) {
       }
 
       const got = chunks[nextToEmit];
+      if (got == null) {
+        /* 该块从没发出去（子请求预算用尽后 launch 不再推进）：正常收尾，别把 null 当对象用 */
+        ctrl.close();
+        return;
+      }
       nextToEmit += 1;
+      chunks[nextToEmit - 1] = null; // 释放已吐出的块（否则 chunks 一直持有，内存随下载量线性增长）
 
       if (got.passthrough) {
         if (got.passthrough.body) {
@@ -291,7 +357,7 @@ async function chunked(url, headers, reqRange, threads, chunkSize) {
       }
 
       if (got.error || !got.buf) {
-        /* 30s 超时 / 重试 3 发仍失败：把原因写进流尾再正常关闭，不静默 error —— 客户端至少拿到
+        /* 超时 / 重试仍失败：把原因写进流尾再正常关闭，不静默 error —— 客户端至少拿到
            已下载部分，诊断在尾巴上看得见（旧做法直接 error = 整流失效） */
         ctrl.enqueue(new TextEncoder().encode(`\n[media-bridge-relay] 第${nextToEmit}块取失败：${got.error || '未知'}`));
         ctrl.close();
@@ -302,7 +368,7 @@ async function chunked(url, headers, reqRange, threads, chunkSize) {
       launch(); // 补发新块，保持 threads 路在飞
     },
   });
-  return new Response(body, { status: r.ranged ? 206 : 200, headers: out });
+  return new Response(body, { status: partial ? 206 : 200, headers: out });
 }
 
 export default {
